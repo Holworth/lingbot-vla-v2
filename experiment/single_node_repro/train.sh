@@ -18,6 +18,9 @@
 #                checkpoint (use with MAX_STEPS=130 for a quick speed test)
 #   MEM_PROBE    1 (default) = run the trainer through mem_probe.py to record PyTorch
 #                allocated/reserved peaks per rank; 0 = launch the trainer directly
+#   NSYS_STEPS   e.g. 31-35: record an Nsight Systems timeline of these steps on rank 0
+#                ($OUT/nsys_rank0.nsys-rep); nsys ends the job after the last step.
+#                NSYS_ARGS adds nsys options, e.g. "--pytorch=autograd-nvtx" for op names
 # Extra arguments are passed to the trainer, e.g. `--train.optimizer muon` for plain Muon.
 set -euo pipefail
 NAME=${1:?usage: train.sh <run_name> [--key value ...]}; shift
@@ -61,6 +64,12 @@ if [ "$MEM_PROBE" = 1 ]; then
   ENTRY=(experiment/single_node_repro/mem_probe.py "${ENTRY[@]}")
   export MEM_PROBE_DIR=$OUT
 fi
+RUNNER=()
+if [ -n "${NSYS_STEPS:-}" ]; then
+  ENTRY=(experiment/single_node_repro/nsys_probe.py "${ENTRY[@]}")
+  RUNNER=(--no-python bash experiment/single_node_repro/nsys_rank0.sh "$PY")
+  export NSYS_STEPS NSYS_OUT=$OUT/nsys_rank0
+fi
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 # Per-second GPU memory, utilization, temperature and thermal throttling; summarize_run.py
 # reads it for peak memory and to flag a GPU that throttled (one slow GPU slows every step).
@@ -68,7 +77,7 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu,temperature.g
   --format=csv,noheader,nounits -l 1 > "$OUT/smi.csv" &
 SMI=$!
 trap 'kill $SMI 2>/dev/null || true' EXIT
-"$PY" -m torch.distributed.run --standalone --nproc-per-node "$NPROC" "${ENTRY[@]}" \
+"$PY" -m torch.distributed.run --standalone --nproc-per-node "$NPROC" "${RUNNER[@]}" "${ENTRY[@]}" \
   "$OUT/config.yaml" \
   --train.micro_batch_size "$MICRO" --train.global_batch_size "$GLOBAL" \
   --train.gradient_accumulation_steps "$GA" \

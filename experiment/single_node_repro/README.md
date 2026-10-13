@@ -176,6 +176,48 @@ MAX_STEPS=130 TIMING_ONLY=1 OPTIMIZER=muon      bash experiment/single_node_repr
   - 前两项来自 `mem_rank*.csv`，最后一项来自 `smi.csv`。
 - **过热降频**：只要有一张卡降频，所有卡的每一步都会被它拖慢。如果统计结果里出现 `thermal throttling on GPU ...`，说明这段 step 耗时不可信，需要缩小统计区间（`--last`），或者先解决散热问题再测。
 
+### 抓 timeline（profiling）
+
+两种方式都只抓 rank 0 的几个预热后的 step，训练代码不改。
+
+**Nsight Systems（`.nsys-rep`，用 Nsight Systems 桌面端打开）**：设置 `NSYS_STEPS` 即可，录完最后一步后 nsys 会结束任务，报告在 `$OUT_ROOT/<run_name>/nsys_rank0.nsys-rep`。
+
+```bash
+MAX_STEPS=45 TIMING_ONLY=1 MEM_PROBE=0 NSYS_STEPS=31-35 OPTIMIZER=dist_muon \
+  bash experiment/single_node_repro/train_pro5000.sh pro5000_distmuon_nsys
+```
+
+- `nsys_probe.py` 在 NVTX 行里标出 `step N` 和每次 `optimizer.step`（如 `CombinedOptimizer.step` 里嵌套 `DistMuon.step`、`AdamW.step`）。
+- `NSYS_ARGS` 可加 nsys 参数，例如 `NSYS_ARGS="--pytorch=autograd-nvtx"` 给每个 PyTorch 算子打 NVTX（开销更大）。
+- 命令行汇总：`nsys stats -r nvtx_sum,cuda_gpu_kern_sum nsys_rank0.nsys-rep`。
+
+**PyTorch profiler（Chrome trace JSON，用 [Perfetto](https://ui.perfetto.dev) 或 `chrome://tracing` 打开）**：用 trainer 自带的开关。抓的是 `[profile_start_step, profile_end_step)`，下面是 step 31–32：
+
+```bash
+MAX_STEPS=36 TIMING_ONLY=1 MEM_PROBE=0 OPTIMIZER=dist_muon \
+  bash experiment/single_node_repro/train_pro5000.sh pro5000_distmuon_torchprof \
+  --train.enable_profiling true --train.profile_start_step 31 --train.profile_end_step 33 \
+  --train.profile_trace_dir "$PWD/output/pro5000_distmuon_torchprof/trace" \
+  --train.profile_record_shapes false --train.profile_profile_memory false --train.profile_with_stack false
+```
+
+- 2 步的 trace 约 250–290 MB（gzip 后约 20 MB）。`chrome://tracing` 打开这么大的文件很慢，建议用 Perfetto，它能直接打开 `.json.gz`。
+- trace 里的 `ProfilerStep#30`、`#31` 对应训练的 step 31、32。
+- trace 写完后，上游代码会因为调用不存在的 `helper.upload_trace` 退出，报 `AttributeError`。trace 文件已经完整写好，不影响使用。
+
+**8×RTX PRO 5000 上的 timeline 结论**（nsys，rank 0，step 31–35 平均；录制时 step 耗时与不录时一致）：
+
+| | Distributed Muon | Muon |
+|---|---:|---:|
+| 前向 + 反向（含梯度裁剪） | 4486 ms | 4484 ms |
+| 其中 NCCL kernel / 未被计算重叠的部分 | 2482 / 857 ms | 2468 / 841 ms |
+| `optimizer.step` | **299 ms** | **2419 ms** |
+| 其中 GPU 计算（主要是 GEMM） | 210 ms | 1633 ms |
+| 其中 NCCL / 未被计算重叠的部分 | 173 / 51 ms | 634 / 634 ms |
+
+- 两者每步相差约 2.1 s，全部来自 `optimizer.step`：Muon 在每个 rank 上对所有矩阵算 Newton-Schulz，再做一次 all-gather；DistMuon 把这部分分摊到各卡。
+- 前向 + 反向里，FSDP 的 all-gather 和 reduce-scatter 每步共约 2.5 s，其中约 0.85 s 没被计算重叠。NCCL 在这台只有 PCIe 的机器上选的是 `RING_LL` 协议。
+
 ## 5. 与官方的差异
 
 | 项目 | 官方 | 本复现 | 说明 |
@@ -194,5 +236,7 @@ MAX_STEPS=130 TIMING_ONLY=1 OPTIMIZER=muon      bash experiment/single_node_repr
 | `train.sh` | 用官方配置填好路径后启动 8 卡训练，同时记录显存和温度 |
 | `train_pro5000.sh` | RTX PRO 5000 的设置：micro 32、GA 1、打开激活重算，用 `OPTIMIZER` 选 dist_muon 或 muon |
 | `mem_probe.py` | 启动包装：训练代码不改，每秒记录各卡 PyTorch 显存峰值 |
+| `nsys_probe.py` | 启动包装：训练代码不改，标出 step 和 optimizer.step 的 NVTX 区间，并在指定 step 开关 nsys 录制 |
+| `nsys_rank0.sh` | `NSYS_STEPS` 打开时由 torchrun 调用：rank 0 在 nsys 下运行，其他 rank 正常运行 |
 | `summarize_run.py` | 统计 step 耗时、墙钟、loss、显存峰值，并标出过热降频的 GPU |
 | `figures/` | 8 张结果和参考图，见"结果 → 图" |
