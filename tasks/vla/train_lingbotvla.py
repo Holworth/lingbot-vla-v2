@@ -327,6 +327,14 @@ class MyTrainingArguments(TrainingArguments):
         default=1,
         metadata={"help": "Max number of FSDP2 reduce-scatters in flight in backward (1 = FSDP2 default: the compute stream waits for the previous reduce-scatter before issuing the next)."},
     )
+    fused_joint_attn_split: bool = field(
+        default=False,
+        metadata={"help": "With fused_joint_qkv_prep: split the flex output into the VLM (bf16) and expert parts with one Triton kernel per direction."},
+    )
+    attention_dtype: Literal["fp32", "bf16"] = field(
+        default="fp32",
+        metadata={"help": "dtype of Q/K/V fed to the joint attention kernel. bf16 requires fused_joint_qkv_prep, fused_joint_attn_split and use_compile; the expert stream is cast back to its own dtype after attention."},
+    )
 
 @dataclass
 class MyDataArguments(DataArguments):
@@ -438,16 +446,35 @@ def main():
         config_kwargs=config_kwargs,
         moe_implementation=getattr(args.model, 'moe_implementation', None),
     )
+    if args.train.fused_joint_attn_split and not args.train.fused_joint_qkv_prep:
+        raise ValueError("fused_joint_attn_split requires fused_joint_qkv_prep (it splits the un-padded flex output)")
     if args.train.fused_joint_qkv_prep:
         # What QwenvlWithExpertV2Model.forward reads: a switch that does not arrive there (undeclared config field,
         # attention_implementation other than flex_cached) would silently run the unfused path.
         qcfg = model.model.qwenvl_with_expert.config
-        if not (getattr(qcfg, "fused_joint_qkv_prep", False) and qcfg.attention_implementation == "flex_cached"):
+        if not (
+            getattr(qcfg, "fused_joint_qkv_prep", False)
+            and qcfg.attention_implementation == "flex_cached"
+            and getattr(qcfg, "fused_joint_attn_split", False) == args.train.fused_joint_attn_split
+        ):
             raise ValueError(
-                "fused_joint_qkv_prep would not take effect: the model config has "
+                "fused_joint_qkv_prep/fused_joint_attn_split would not take effect: the model config has "
                 f"fused_joint_qkv_prep={getattr(qcfg, 'fused_joint_qkv_prep', None)}, "
+                f"fused_joint_attn_split={getattr(qcfg, 'fused_joint_attn_split', None)}, "
                 f"attention_implementation={qcfg.attention_implementation!r} (needs 'flex_cached')"
             )
+    if args.train.attention_dtype != "fp32":
+        # same check for --train.attention_dtype (QwenvlWithExpertV2Model validates the combination)
+        qcfg = model.model.qwenvl_with_expert.config
+        got = getattr(qcfg, "attention_dtype", None)
+        if got != args.train.attention_dtype:
+            raise ValueError(f"attention_dtype would not take effect: the model config has attention_dtype={got!r}")
+        if args.train.attention_dtype == "bf16" and not args.train.use_compile:
+            # flex attention is a Triton kernel only under torch.compile (here: use_compile); outside it PyTorch runs the
+            # eager reference, which with bf16 Q/K/V rounds the logits, dP and Delta to bf16 (the compiled kernel keeps
+            # them in fp32) and ignores the kernel options
+            raise ValueError("attention_dtype=bf16 requires use_compile=true: without torch.compile flex attention runs "
+                             "PyTorch's eager reference, which rounds the attention logits and gradients to bf16")
     if args.train.fused_swiglu:
         from lingbotvla.ops.swiglu import apply_fused_swiglu
         n_patched = apply_fused_swiglu(model)

@@ -19,6 +19,13 @@ import einops
 
 FLEX_SPARSE_BLOCK_SIZE = 128
 FLEX_KERNEL_OPTIONS = {"BLOCK_M": 32, "BLOCK_N": 64, "num_warps": 4, "num_stages": 2}
+# bf16 Q/K/V (--train.attention_dtype bf16): for bf16 / head_dim 128 on compute capability >= 9.0 Inductor gives the
+# backward H100's tile (64 x 128), which with the num_stages / num_warps above needs 103936 B of shared memory per
+# block; sm_120 has 101376 B, so the backward would not compile. It gets the forward's tile instead (dK/dV 32 x 64,
+# dQ 64 x 32). fp32 keeps the options above.
+FLEX_KERNEL_OPTIONS_BF16 = {
+    **FLEX_KERNEL_OPTIONS, "bwd_BLOCK_M1": 32, "bwd_BLOCK_N1": 64, "bwd_BLOCK_M2": 64, "bwd_BLOCK_N2": 32,
+}
 
 if Version(torch.__version__) > Version("2.5.0"):
     # Ffex attention is only available from torch 2.5 onwards
@@ -236,15 +243,19 @@ def flex_attention_with_block_mask(
     return attn_output
 
 
-def flex_attention_prepared(Q, K, V, block_mask, scaling=None):
+def flex_attention_prepared(Q, K, V, block_mask, scaling=None, raw_output=False):
     """Q [B, Hq, L, D], K/V [B, Hkv, L, D] already in flex layout (joint_qkv_prep output, no padding).
 
-    Same output as flex_attention_with_block_mask: [B, L, Hq * D] in Q's dtype.
+    Same output as flex_attention_with_block_mask: [B, L, Hq * D] in Q's dtype; with raw_output=True flex's own
+    output [B, Hq, L, D] instead (for joint_attn_split).
     """
     B, Hq, L, D = Q.shape
     out, _ = flex_attention(
         Q, K, V, block_mask=block_mask, enable_gqa=True,
-        scale=D ** -0.5 if scaling is None else scaling, return_lse=True, kernel_options=FLEX_KERNEL_OPTIONS,
+        scale=D ** -0.5 if scaling is None else scaling, return_lse=True,
+        kernel_options=FLEX_KERNEL_OPTIONS_BF16 if Q.dtype == torch.bfloat16 else FLEX_KERNEL_OPTIONS,
     )
-    # one copy, like the .contiguous() of the padded path
+    if raw_output:
+        return out
+    # one copy, like the .contiguous() of the padded path (--train.fused_joint_attn_split fuses it with the split)
     return out.transpose(1, 2).reshape(B, L, Hq * D)
