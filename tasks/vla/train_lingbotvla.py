@@ -284,6 +284,10 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to apply FSDP2 for VLM."},
     )
+    fused_joint_qkv_prep: bool = field(
+        default=False,
+        metadata={"help": "Fuse cast+concat+RoPE+transpose of the joint-attention q/k/v into one Triton kernel per tensor and run flex without padding."},
+    )
 
 @dataclass
 class MyDataArguments(DataArguments):
@@ -380,6 +384,16 @@ def main():
         config_kwargs=config_kwargs,
         moe_implementation=getattr(args.model, 'moe_implementation', None),
     )
+    if args.train.fused_joint_qkv_prep:
+        # What QwenvlWithExpertV2Model.forward reads: a switch that does not arrive there (undeclared config field,
+        # attention_implementation other than flex_cached) would silently run the unfused path.
+        qcfg = model.model.qwenvl_with_expert.config
+        if not (getattr(qcfg, "fused_joint_qkv_prep", False) and qcfg.attention_implementation == "flex_cached"):
+            raise ValueError(
+                "fused_joint_qkv_prep would not take effect: the model config has "
+                f"fused_joint_qkv_prep={getattr(qcfg, 'fused_joint_qkv_prep', None)}, "
+                f"attention_implementation={qcfg.attention_implementation!r} (needs 'flex_cached')"
+            )
     use_depth_align = True if args.train.align_params != {} else False
     use_future_depth = args.train.align_params.get('depth', {}).get('use_future_depth', False)
     use_future_video = use_depth_align and args.train.align_params.get('use_future_video', False)
