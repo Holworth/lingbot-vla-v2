@@ -292,6 +292,14 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Fuse silu(gate)*up of Qwen3VLTextMLP into one Triton kernel (fwd+bwd), bit-exact with eager."},
     )
+    fused_joint_attn_split: bool = field(
+        default=False,
+        metadata={"help": "With fused_joint_qkv_prep: split the flex output into the VLM (bf16) and expert parts with one Triton kernel per direction."},
+    )
+    attention_dtype: Literal["fp32", "bf16"] = field(
+        default="fp32",
+        metadata={"help": "dtype of Q/K/V fed to the joint attention kernel. bf16 requires fused_joint_qkv_prep and fused_joint_attn_split; the expert stream is cast back to its own dtype after attention."},
+    )
 
 @dataclass
 class MyDataArguments(DataArguments):
@@ -388,16 +396,29 @@ def main():
         config_kwargs=config_kwargs,
         moe_implementation=getattr(args.model, 'moe_implementation', None),
     )
+    if args.train.fused_joint_attn_split and not args.train.fused_joint_qkv_prep:
+        raise ValueError("fused_joint_attn_split requires fused_joint_qkv_prep (it splits the un-padded flex output)")
     if args.train.fused_joint_qkv_prep:
         # What QwenvlWithExpertV2Model.forward reads: a switch that does not arrive there (undeclared config field,
         # attention_implementation other than flex_cached) would silently run the unfused path.
         qcfg = model.model.qwenvl_with_expert.config
-        if not (getattr(qcfg, "fused_joint_qkv_prep", False) and qcfg.attention_implementation == "flex_cached"):
+        if not (
+            getattr(qcfg, "fused_joint_qkv_prep", False)
+            and qcfg.attention_implementation == "flex_cached"
+            and getattr(qcfg, "fused_joint_attn_split", False) == args.train.fused_joint_attn_split
+        ):
             raise ValueError(
-                "fused_joint_qkv_prep would not take effect: the model config has "
+                "fused_joint_qkv_prep/fused_joint_attn_split would not take effect: the model config has "
                 f"fused_joint_qkv_prep={getattr(qcfg, 'fused_joint_qkv_prep', None)}, "
+                f"fused_joint_attn_split={getattr(qcfg, 'fused_joint_attn_split', None)}, "
                 f"attention_implementation={qcfg.attention_implementation!r} (needs 'flex_cached')"
             )
+    if args.train.attention_dtype != "fp32":
+        # same check for --train.attention_dtype (QwenvlWithExpertV2Model validates the combination)
+        qcfg = model.model.qwenvl_with_expert.config
+        got = getattr(qcfg, "attention_dtype", None)
+        if got != args.train.attention_dtype:
+            raise ValueError(f"attention_dtype would not take effect: the model config has attention_dtype={got!r}")
     if args.train.fused_swiglu:
         from lingbotvla.ops.swiglu import apply_fused_swiglu
         n_patched = apply_fused_swiglu(model)
