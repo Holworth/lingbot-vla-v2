@@ -18,6 +18,7 @@ import torch
 from ..distributed.moe import EPGroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
 from ..distributed.parallel_state import get_parallel_state
 from ..utils.import_utils import is_fused_moe_available
+from . import moe_glue
 
 
 if is_fused_moe_available():
@@ -36,17 +37,28 @@ class FusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
+        counting_sort=False,
     ):
-        # MOE Step 3: dispatch input tokens to the experts
-        # result shape is (batch_size * sequence_len * topk, hidden_size)
-        # MOE Step 3-1: compute the token num for each expert
-        # splits shape (num_experts)
-        splits = expert_histogram(expert_index, num_experts)
+        # --train.moe_glue_opt K2b (moe_glue.route_index): scatter_index, cumsum_t and scattered_gate_weight from one
+        # counting-sort kernel instead of the histogram, the two radix sorts, the cumsum and the index_put below
+        routed = moe_glue.route_index(expert_index, gate_weights, num_experts) if counting_sort else None
+        if routed is None:
+            # MOE Step 3: dispatch input tokens to the experts
+            # result shape is (batch_size * sequence_len * topk, hidden_size)
+            # MOE Step 3-1: compute the token num for each expert
+            # splits shape (num_experts)
+            splits = expert_histogram(expert_index, num_experts)
 
-        # MOE Step 3-2: compute the each token's index in result
-        # scatter_index shape (batch_size * sequence_len, topk)
-        # TODO(wenyawei): opt it
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+            # MOE Step 3-2: compute the each token's index in result
+            # scatter_index shape (batch_size * sequence_len, topk)
+            # TODO(wenyawei): opt it
+            scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        else:
+            scatter_index, cumsum_t, scattered_gate_weight = routed
+            if moe_glue.CHECK:
+                moe_glue.check_route_index(expert_index, gate_weights, num_experts, *routed)
+        if moe_glue.DUMP:  # LINGBOT_MOE_ROUTING_DUMP_STEPS (debug)
+            moe_glue.routing_dump_record("scatter_index", scatter_index)
 
         # MOE Step 3-3: compute the result, select tokens by scatter_index, and put them together
         # scatter_output shape (batch_size * sequence_len * topk, hidden_size)
@@ -54,7 +66,8 @@ class FusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 4: compute linear layer 1-1
         # Not consistent.
-        cumsum_t = torch.cumsum(splits, dim=0)
+        if routed is None:
+            cumsum_t = torch.cumsum(splits, dim=0)
         fc1_1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_weight,
@@ -85,9 +98,10 @@ class FusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 8: compute the the weighted linear layer 1 result
         # MOE Step 8-1: compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
-        reshaped_gate_weight = gate_weights.reshape(-1, 1)
-        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
+        if routed is None:
+            reshaped_gate_weight = gate_weights.reshape(-1, 1)
+            scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
+            scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
 
         # MOE Step 8-2: multiply activate with scattered_gate_weight
         # fc1_weighted_output shape is (batch_size * sequence_len * topk, ffn_dim)
@@ -268,6 +282,7 @@ class FusedMoeExpertFunction(torch.autograd.Function):
             grad_fc1_1_weight,  # fc1_1_weight
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # counting_sort
         )
 
 
@@ -285,12 +300,16 @@ def fused_moe_forward(
     # Cast before the EP/non-EP branch so both paths are covered (including
     # fused + ep_size=1 + enable_fp32=true). Weights must also be cast because
     # they may be fp32 when enable_fp32=true.
+    glue = getattr(module, "_moe_glue", None)  # --train.moe_glue_opt (lingbotvla/ops/moe_glue.py)
     compute_dtype = torch.bfloat16
     hidden_states = hidden_states.to(compute_dtype)
     routing_weights = routing_weights.to(compute_dtype)
-    fc1_1_weight = fc1_1_weight.to(compute_dtype)
-    fc1_2_weight = fc1_2_weight.to(compute_dtype)
-    fc2_weight = fc2_weight.to(compute_dtype)
+    if glue is None or not glue.fp32_weights:
+        fc1_1_weight = fc1_1_weight.to(compute_dtype)
+        fc1_2_weight = fc1_2_weight.to(compute_dtype)
+        fc2_weight = fc2_weight.to(compute_dtype)
+    # else K2a: fp32 weights go into the grouped GEMMs as they are; group_gemm_same_nk casts the B tile to bf16 in the
+    # kernel and the wgrad GEMMs write fp32 gradients (torch.empty_like of the fp32 weights in backward)
 
     # FSDP2 all-gathered weights are DTensor — triton kernels cannot handle
     # DTensor metadata, so convert to plain tensors via to_local() which is
@@ -368,6 +387,7 @@ def fused_moe_forward(
             fc1_1_weight,
             fc1_2_weight,
             fc2_weight,
+            glue is not None and glue.counting_sort,
         )
 
     return final_hidden_states

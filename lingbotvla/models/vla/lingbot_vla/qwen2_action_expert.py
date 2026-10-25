@@ -76,6 +76,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Model as _Qwen2Model,
     Qwen2ForCausalLM as _Qwen2ForCausalLM,
 )
+from lingbotvla.ops import moe_glue
 from lingbotvla.ops.robby_moe import robby_moe_forward
 # from transformers.models.mistral.modeling_mistral import MistralMLP
 
@@ -291,14 +292,24 @@ class Qwen2TokenMoeBlock(nn.Module):
 
         scores_for_choice = routing_scores + self.e_score_correction_bias.unsqueeze(0)
         _, selected_experts = torch.topk(scores_for_choice, self.top_k, dim=-1)
-        routing_weights = routing_scores.gather(1, selected_experts)
-        if self.training:
-            _update_moe_runtime_stats(self, routing_weights, selected_experts)
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        if self.routed_scaling_factor != 1.0:
-            routing_weights = routing_weights * self.routed_scaling_factor
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        routing_weights = None
+        glue = getattr(self, "_moe_glue", None)  # --train.moe_glue_opt (lingbotvla/ops/moe_glue.py)
+        if glue is not None and glue.router:
+            # K2c: the lines below as one Triton kernel forward and one backward, bitwise equal; None if not covered
+            routing_weights = moe_glue.router_tail(self, routing_scores, selected_experts, hidden_states.dtype)
+        if routing_weights is None:
+            routing_weights = routing_scores.gather(1, selected_experts)
+            if self.training:
+                _update_moe_runtime_stats(self, routing_weights, selected_experts)
+            if self.norm_topk_prob:
+                routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
+            if self.routed_scaling_factor != 1.0:
+                routing_weights = routing_weights * self.routed_scaling_factor
+            routing_weights = routing_weights.to(hidden_states.dtype)
+        if moe_glue.DUMP:  # LINGBOT_MOE_ROUTING_DUMP_STEPS (debug)
+            moe_glue.routing_dump_record("router_logits", router_logits)
+            moe_glue.routing_dump_record("selected_experts", selected_experts)
+            moe_glue.routing_dump_record("routing_weights", routing_weights)
 
         # Expert computation: fused (group_gemm) or eager (per-expert loop)
         if self._moe_implementation == 'fused':

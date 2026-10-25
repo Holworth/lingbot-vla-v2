@@ -59,6 +59,8 @@ def _get_cuda_autotune_config():
         "N_ALIGNED": lambda args: args["N"] % args["BLOCK_N"] == 0,
         "K_ALIGNED": lambda args: args["K"] % args["BLOCK_K"] == 0,
         "HAS_ACTIVATION": lambda args: args["ACTIVATION"] is not None,
+        # fp32 B (--train.moe_glue_opt K2a: fp32 expert weights) is cast to A's dtype after the load
+        "B_CAST": lambda args: args["b_ptr"].dtype != args["a_ptr"].dtype,
     }
 )
 @triton.jit
@@ -86,6 +88,7 @@ def group_gemm_same_nk_kernel(
     ACTIVATION: tl.constexpr,
     HAS_ACTIVATION: tl.constexpr,
     SAVE_ACTIVATION: tl.constexpr,
+    B_CAST: tl.constexpr,
 ):
     m, n = get_pid_mn(tl.program_id(axis=0), max_M, N, BLOCK_M, BLOCK_N, GROUP)
     gid = tl.program_id(1).to(tl.uint64)
@@ -130,6 +133,8 @@ def group_gemm_same_nk_kernel(
         # Really loading a 2D block. Using `load_with_pred_1d` as we only have one predicate.
         a = load_with_pred_1d(a_ptrs, K_ALIGNED, blk_k[None, :] < K - k * BLOCK_K, other=0)
         b = load_with_pred_1d(b_ptrs, K_ALIGNED, blk_k[:, None] < K - k * BLOCK_K, other=0)
+        if B_CAST:
+            b = b.to(a_ptr.dtype.element_ty)  # RTNE, the same conversion as .to(torch.bfloat16)
 
         c = tl.dot(a, b, c)
 
@@ -185,7 +190,8 @@ def group_gemm_same_nk(
     assert not transpose_a, "Transpose A not tested yet."
 
     assert a.dtype in [torch.bfloat16, torch.float16], a.dtype
-    assert b.dtype in [torch.bfloat16, torch.float16], b.dtype
+    # fp32 b: cast to a.dtype inside the kernel (--train.moe_glue_opt K2a)
+    assert b.dtype in [torch.bfloat16, torch.float16, torch.float32], b.dtype
 
     assert a.device == b.device, f"a.device = {a.device}, b.device = {b.device}"
 
