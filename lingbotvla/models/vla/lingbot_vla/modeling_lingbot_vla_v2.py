@@ -1,4 +1,5 @@
 import einops
+import os
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -130,6 +131,8 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
             getattr(self.config, "fused_joint_qkv_prep", False) and getattr(self.config, "fused_joint_attn_split", False)
         ):
             raise ValueError("attention_dtype=bf16 requires fused_joint_qkv_prep and fused_joint_attn_split")
+        if getattr(self.config, "joint_fa2_attention", False) and getattr(self.config, "attention_dtype", "fp32") != "bf16":
+            raise ValueError("joint_fa2_attention requires attention_dtype=bf16 (FlashAttention-2 has no fp32 path)")
         vlm_config = AutoConfig.from_pretrained(self.config.tokenizer_path)
         if self.config.vocab_size not in (0, 257152):
             vlm_config.text_config.vocab_size = self.config.vocab_size
@@ -326,6 +329,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         ada_cond: List[torch.FloatTensor] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        fa2_plan=None,
     ):
         models = [self.qwenvl.model.language_model, self.qwen_expert.model]
         num_layers = self.qwenvl.config.text_config.num_hidden_layers
@@ -365,6 +369,11 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         # --train.attention_dtype bf16 (needs both of the above): joint_qkv_prep writes bf16 Q/K/V, flex runs in bf16,
         # and the split returns the expert part in the expert's own dtype
         attn_dtype = torch.bfloat16 if getattr(self.config, "attention_dtype", "fp32") == "bf16" else torch.float32
+        # --train.joint_fa2_attention (needs bf16): two FlashAttention-2 varlen calls replace prep + mask + flex + split,
+        # on the plan FlowMatchingV2.forward built from the pad masks (lingbotvla/ops/joint_fa2_attention.py)
+        use_fa2 = use_split and fa2_plan is not None and getattr(self.config, "joint_fa2_attention", False)
+        if use_fa2:
+            from lingbotvla.ops.joint_fa2_attention import joint_fa2_attention
 
         for layer_idx in range(num_layers):
             query_states = []
@@ -387,7 +396,16 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                 key_states.append(k.float())
                 value_states.append(v.float())
 
-            if use_fused:
+            if use_fa2:
+                (q_v, k_v, v_v), (q_e, k_e, v_e) = qkv_raw
+                # att_vlm [B, Lv, Hq*D] in the VLM hidden dtype, att_exp [B, Le, Hq*D] in the dtype of the expert's
+                # q/k/v (fp32; see the split below), no mask build
+                att_parts = joint_fa2_attention(
+                    q_v, k_v, v_v, q_e, k_e, v_e, rope_cos, rope_sin, fa2_plan,
+                    attn_dtype=attn_dtype, vlm_dtype=inputs_embeds[0].dtype, exp_dtype=q_e.dtype,
+                )
+                att_output = None  # each stream gets its own part, att_parts (use_split)
+            elif use_fused:
                 (q_v, k_v, v_v), (q_e, k_e, v_e) = qkv_raw
                 # attn_dtype [B, Hq|Hkv, L, D], L = Lv + Le not padded to the flex block size
                 query_states, key_states, value_states = joint_qkv_prep(
@@ -526,6 +544,7 @@ class FlowMatchingV2(FlowMatchingV1):
             "fused_joint_qkv_prep",
             "fused_joint_attn_split",
             "attention_dtype",
+            "joint_fa2_attention",
             "vit_attn_implementation",
             "use_moe",
             "bias_update_speed",
@@ -905,6 +924,9 @@ class FlowMatchingV2(FlowMatchingV1):
             prefix_len=prefix_len,
         )
         position_ids = self._build_full_position_ids(prefix_position_ids, prefix_pad_masks, suffix_pad_masks)
+        fa2_plan = None
+        if getattr(self.config, "joint_fa2_attention", False):
+            fa2_plan = self._build_fa2_plan(pad_masks, prefix_len, suffix_pad_masks.shape[1], att_2d_masks)
 
         (outputs_embeds, suffix_out), _, router_logits_list = self.qwenvl_with_expert.forward(
             attention_mask=att_2d_masks,
@@ -917,6 +939,7 @@ class FlowMatchingV2(FlowMatchingV1):
             ada_cond=time_embs if getattr(self.config, "adanorm_time", False) else None,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            fa2_plan=fa2_plan,
         )
         align_metrics = {}
         if self.config.align_params != {}:
@@ -992,6 +1015,22 @@ class FlowMatchingV2(FlowMatchingV1):
         if align_metrics:
             moe_metrics.update(align_metrics)
         return losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds
+
+    @torch.compiler.disable
+    def _build_fa2_plan(self, pad_masks, prefix_len, suffix_len, att_2d_masks):
+        """--train.joint_fa2_attention: index maps and cu_seqlens of the two FlashAttention-2 calls, from the pad masks
+        alone. They implement the plain mask (causal prefix, state sees the prefix, actions see everything), which
+        JOINT_FA2_CHECK_MASK=1 compares bit by bit with att_2d_masks (a host sync, for validation runs only)."""
+        if getattr(self, "block_future_depth_to_action", False) or getattr(self, "block_suffix_to_future_video", False):
+            raise NotImplementedError("joint_fa2_attention assumes the plain prefix-causal / suffix mask (no suffix->query blocking)")
+        if not getattr(self.config, "vlm_causal", False):
+            raise NotImplementedError("joint_fa2_attention assumes vlm_causal=True (causal prefix)")
+        from lingbotvla.ops.joint_fa2_attention import build_fa2_plan, check_plan_against_mask
+
+        plan = build_fa2_plan(pad_masks, prefix_len, suffix_len)
+        if os.environ.get("JOINT_FA2_CHECK_MASK") == "1":
+            check_plan_against_mask(plan, att_2d_masks)
+        return plan
 
     def sample_actions(
         self,

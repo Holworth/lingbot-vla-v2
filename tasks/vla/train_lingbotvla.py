@@ -300,6 +300,10 @@ class MyTrainingArguments(TrainingArguments):
         default="fp32",
         metadata={"help": "dtype of Q/K/V fed to the joint attention kernel. bf16 requires fused_joint_qkv_prep and fused_joint_attn_split; the expert stream is cast back to its own dtype after attention."},
     )
+    joint_fa2_attention: bool = field(
+        default=False,
+        metadata={"help": "Run the joint attention as two FlashAttention-2 varlen calls (prefix+state causal, actions full) instead of flex. Requires attention_dtype=bf16."},
+    )
 
 @dataclass
 class MyDataArguments(DataArguments):
@@ -413,12 +417,12 @@ def main():
                 f"fused_joint_attn_split={getattr(qcfg, 'fused_joint_attn_split', None)}, "
                 f"attention_implementation={qcfg.attention_implementation!r} (needs 'flex_cached')"
             )
-    if args.train.attention_dtype != "fp32":
-        # same check for --train.attention_dtype (QwenvlWithExpertV2Model validates the combination)
+    if args.train.attention_dtype != "fp32" or args.train.joint_fa2_attention:
+        # same check for --train.attention_dtype / joint_fa2_attention (QwenvlWithExpertV2Model validates the combination)
         qcfg = model.model.qwenvl_with_expert.config
-        got = getattr(qcfg, "attention_dtype", None)
-        if got != args.train.attention_dtype:
-            raise ValueError(f"attention_dtype would not take effect: the model config has attention_dtype={got!r}")
+        got = (getattr(qcfg, "attention_dtype", None), getattr(qcfg, "joint_fa2_attention", None))
+        if got != (args.train.attention_dtype, args.train.joint_fa2_attention):
+            raise ValueError(f"attention_dtype/joint_fa2_attention would not take effect: the model config has {got}")
     if args.train.fused_swiglu:
         from lingbotvla.ops.swiglu import apply_fused_swiglu
         n_patched = apply_fused_swiglu(model)
