@@ -284,6 +284,23 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to apply FSDP2 for VLM."},
     )
+    fsdp_split_root: bool = field(
+        default=False,
+        metadata={"help": "FSDP2: take the 24 ViT blocks, 3 deepstack mergers, ViT merger, embed_tokens and the 4 align "
+                          "heads out of the root unit into their own units (requires vlm_fsdp)."},
+    )
+    fsdp_split_root_compile_vit: bool = field(
+        default=False,
+        metadata={"help": "With fsdp_split_root: torch.compile the ViT blocks explicitly."},
+    )
+    fsdp_split_root_prefetch: bool = field(
+        default=False,
+        metadata={"help": "With fsdp_split_root: explicit forward prefetch chain root -> ViT units -> embed_tokens."},
+    )
+    fsdp_split_action_out_proj: bool = field(
+        default=False,
+        metadata={"help": "With fsdp_split_root: put action_out_proj in its own unit so the root AllGather is 16-byte aligned."},
+    )
     fused_joint_qkv_prep: bool = field(
         default=False,
         metadata={"help": "Fuse cast+concat+RoPE+transpose of the joint-attention q/k/v into one Triton kernel per tensor and run flex without padding."},
@@ -303,6 +320,22 @@ class MyTrainingArguments(TrainingArguments):
     joint_fa2_attention: bool = field(
         default=False,
         metadata={"help": "Run the joint attention as two FlashAttention-2 varlen calls (prefix+state causal, actions full) instead of flex. Requires attention_dtype=bf16."},
+    )
+    fsdp_no_reshard_after_backward: bool = field(
+        default=False,
+        metadata={"help": "Keep layer parameters unsharded through backward (no re-all-gather for the second call of each joint layer); reshard explicitly after backward. Meant for enable_full_shard=false (rejected otherwise)."},
+    )
+    fsdp_forward_prefetch_depth: int = field(
+        default=0,
+        metadata={"help": "All-gather the first k joint layers at step start (before the teacher phase) and keep a lookahead of k layers in the layer loop. 0 = FSDP default."},
+    )
+    fsdp_prologue_under: str = field(
+        default="teacher",
+        metadata={"help": "Where the fsdp_forward_prefetch_depth prologue runs: 'teacher' = at step start, its all-gathers overlap the teacher models; 'vit' = right before the model forward, after all-gathering the root and the ViT / merger / embed_tokens units in call order, so the layers' all-gathers overlap the ViT / prefix compute and the teacher phase is not needed."},
+    )
+    fsdp_rs_inflight_depth: int = field(
+        default=1,
+        metadata={"help": "Max number of FSDP2 reduce-scatters in flight in backward (1 = FSDP2 default: the compute stream waits for the previous reduce-scatter before issuing the next)."},
     )
 
 @dataclass
@@ -538,10 +571,64 @@ def main():
         use_depth_align=use_depth_align,
         split_fused_experts_from_decoder_fsdp=args.train.split_fused_experts_from_decoder_fsdp,
         vlm_fsdp=args.train.vlm_fsdp,
+        fsdp_split_root=args.train.fsdp_split_root,
+        fsdp_split_root_compile_vit=args.train.fsdp_split_root_compile_vit,
+        fsdp_split_root_prefetch=args.train.fsdp_split_root_prefetch,
+        fsdp_split_action_out_proj=args.train.fsdp_split_action_out_proj,
         use_future_image=args.data.use_future_image,
     )
     state_hash_steps = steps_from_env("LINGBOT_STATE_HASH_STEPS")  # debug hooks for bit-exact run comparisons
     params_dump_steps = steps_from_env("LINGBOT_PARAMS_DUMP_STEPS")
+    layer_comm = None
+    if args.train.fsdp_prologue_under not in ("teacher", "vit"):
+        raise ValueError(f"fsdp_prologue_under must be 'teacher' or 'vit', got {args.train.fsdp_prologue_under!r}")
+    if args.train.fsdp_prologue_under == "vit" and args.train.fsdp_forward_prefetch_depth == 0:
+        raise ValueError("fsdp_prologue_under=vit requires fsdp_forward_prefetch_depth > 0")
+    if args.train.fsdp_forward_prefetch_depth < 0 or args.train.fsdp_rs_inflight_depth < 1:
+        raise ValueError(f"need fsdp_forward_prefetch_depth >= 0 and fsdp_rs_inflight_depth >= 1, got "
+                         f"{args.train.fsdp_forward_prefetch_depth} and {args.train.fsdp_rs_inflight_depth}")
+    if args.train.fsdp_no_reshard_after_backward and args.train.enable_full_shard:
+        # with reshard_after_forward every layer would stay unsharded from its first backward all-gather until
+        # after the backward (~13 GiB per rank here) instead of only through the backward of its two calls
+        raise ValueError("fsdp_no_reshard_after_backward is meant for enable_full_shard=false")
+    if args.train.fsdp_no_reshard_after_backward or args.train.fsdp_forward_prefetch_depth > 0 or args.train.fsdp_rs_inflight_depth > 1:
+        if args.train.data_parallel_mode != "fsdp2":
+            raise ValueError("layer comm scheduling (fsdp_no_reshard_after_backward / fsdp_forward_prefetch_depth / "
+                             "fsdp_rs_inflight_depth) is FSDP2-only")
+        from lingbotvla.distributed.fsdp_layer_comm import LayerCommScheduler
+        core = model.model.qwenvl_with_expert
+        prefix_units = None
+        if args.train.fsdp_prologue_under == "vit":
+            # The FSDP units the forward all-gathers before the layer loop, in call order: the root, then (fsdp_split_root)
+            # the ViT blocks with the deepstack mergers after their blocks, the ViT merger and embed_tokens
+            prefix_units = [model]
+            if args.train.fsdp_split_root:
+                visual = core.qwenvl.model.visual
+                deepstack_at = list(visual.deepstack_visual_indexes)
+                for j, block in enumerate(visual.blocks):
+                    prefix_units.append(block)
+                    if j in deepstack_at:
+                        prefix_units.append(visual.deepstack_merger_list[deepstack_at.index(j)])
+                prefix_units += [visual.merger, core.qwenvl.model.language_model.embed_tokens]
+        layer_comm = LayerCommScheduler(
+            list(core.qwenvl.model.language_model.layers),
+            list(core.qwen_expert.model.layers),
+            prefetch_depth=args.train.fsdp_forward_prefetch_depth,
+            no_reshard_after_backward=args.train.fsdp_no_reshard_after_backward,
+            prefix_units=prefix_units,
+            rs_inflight_depth=args.train.fsdp_rs_inflight_depth,
+        )
+        layer_comm.configure()
+        if layer_comm.rs_inflight is not None:
+            # the post_backward patch applies to every FSDP2 unit, not only the layers: check all of them
+            from torch.distributed.fsdp import FSDPModule
+            layer_comm.rs_inflight.check([m._get_fsdp_state()._fsdp_param_group for m in model.modules()
+                                          if isinstance(m, FSDPModule) and m._get_fsdp_state()._fsdp_param_group is not None])
+        logger.info_rank0(f"LayerCommScheduler: depth={layer_comm.depth}, no_reshard_after_backward={layer_comm.no_reshard}, "
+                          f"{layer_comm.n} layers, prologue under {args.train.fsdp_prologue_under}"
+                          f"{f' after {len(layer_comm.prefix)} prefix units' if layer_comm.prefix else ''}, "
+                          f"reduce-scatters in flight {layer_comm.rs_inflight_depth}"
+                          f"{f' (wrapper installed, RS stress {layer_comm.rs_inflight.stress_ticks} ticks)' if layer_comm.rs_inflight is not None else ''}")
     logger.info_rank0(model)
     if args.train.use_compile:
         model = torch.compile(model)
@@ -812,6 +899,8 @@ def main():
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
                 future_video_effective_fps = micro_batch.pop('future_video_effective_fps', None)
+                if layer_comm is not None and global_step > 1 and not layer_comm.prefix:
+                    layer_comm.prologue()
                 depth_forward_time = 0
                 if use_depth_align:
                     with torch.no_grad():
@@ -843,6 +932,8 @@ def main():
                             future_video_target_rgb = future_pil_images
                         depth_forward_time = time.time() - depth_start_time
 
+                if layer_comm is not None and global_step > 1 and layer_comm.prefix:
+                    layer_comm.prologue()  # fsdp_prologue_under=vit: its all-gathers run under the ViT / prefix compute
                 with model_fwd_context:
                     model_outputs = model(
                         **micro_batch,
@@ -883,6 +974,19 @@ def main():
 
                 with model_bwd_context:
                     loss.backward()
+                if layer_comm is not None:
+                    if layer_comm.rs_inflight is not None:
+                        if global_step <= 3 and args.train.global_rank == 0:
+                            logger.info(f"rs_inflight: max pending {layer_comm.rs_inflight.max_pending}, depth {layer_comm.rs_inflight.depth}")
+                        layer_comm.rs_inflight.max_pending = 0
+                    if layer_comm.no_reshard and global_step <= 3 and args.train.global_rank == 0:
+                        _alloc_before = torch.cuda.memory_allocated()
+                    layer_comm.after_backward()
+                    if layer_comm.no_reshard and global_step <= 3 and args.train.global_rank == 0:
+                        _alloc_after = torch.cuda.memory_allocated()
+                        logger.info(f"layer_comm reshard after backward, step {global_step}: memory_allocated "
+                                    f"{_alloc_before / 2**30:.3f} -> {_alloc_after / 2**30:.3f} GiB "
+                                    f"(-{(_alloc_before - _alloc_after) / 2**30:.3f} GiB)")
 
                 total_loss += loss.item()
                 total_vla_loss += vla_loss.item()

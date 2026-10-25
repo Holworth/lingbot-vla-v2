@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import collections
 import types
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -42,7 +43,7 @@ from .utils import get_module_from_path, set_module_from_path
 
 
 if is_torch_version_greater_than("2.4"):
-    from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+    from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor.parallel import parallelize_module
 
 
@@ -58,6 +59,56 @@ def _resolve(root: Any, paths: List[tuple[str, ...]]) -> tuple[Optional[Any], Op
         if current is not None:
             return current, path
     return None, None
+
+def _collect_split_root_units(model: "nn.Module") -> List[tuple[str, "nn.Module"]]:
+    """Modules fsdp_split_root takes out of the root FSDP unit, in forward call order, as [(fqn, module)].
+
+    The 24 ViT blocks with the 3 deepstack mergers after blocks 5, 11 and 17, the ViT merger, embed_tokens and the 4
+    TaskTokenDepthHead align heads. Raises if anything differs from that.
+    """
+    from lingbotvla.models.vla.vision_models.align_heads.depth_head import TaskTokenDepthHead
+
+    def check(ok: bool, msg: str) -> None:
+        if not ok:
+            raise RuntimeError(f"fsdp_split_root: {msg}")
+
+    name_of = {id(m): n for n, m in model.named_modules()}
+    qwenvl = model.model.qwenvl_with_expert.qwenvl
+    visual = qwenvl.model.visual
+    embed = qwenvl.model.language_model.embed_tokens
+    check(type(visual).__name__ == "Qwen3VLVisionModel", f"visual is {type(visual).__name__}")
+    blocks = list(visual.blocks)
+    check(len(blocks) == 24 and all(type(b).__name__ == "Qwen3VLVisionBlock" for b in blocks),
+          f"visual.blocks: {len(blocks)} x {sorted({type(b).__name__ for b in blocks})}")
+    deepstack_at = list(visual.deepstack_visual_indexes)
+    check(deepstack_at == [5, 11, 17] and len(visual.deepstack_merger_list) == 3,
+          f"deepstack_visual_indexes {deepstack_at}, {len(visual.deepstack_merger_list)} deepstack mergers")
+    check(isinstance(embed, nn.Embedding) and tuple(embed.weight.shape) == (151936, 2560),
+          f"embed_tokens is {type(embed).__name__} {tuple(getattr(getattr(embed, 'weight', None), 'shape', ()))}")
+    heads = [m for _, m in model.named_modules() if isinstance(m, TaskTokenDepthHead)]
+    check(len(heads) == 4, f"{len(heads)} TaskTokenDepthHead: {[name_of[id(m)] for m in heads]}")
+
+    units = []
+    for i, block in enumerate(blocks):  # forward call order
+        units.append(block)
+        if i in deepstack_at:
+            units.append(visual.deepstack_merger_list[deepstack_at.index(i)])
+    units += [visual.merger, embed] + heads
+
+    for m in units:
+        check(not isinstance(m, FSDPModule), f"{name_of[id(m)]} is already an FSDP unit")
+    owner = {}
+    for m in units:
+        for sub in m.modules():
+            check(id(sub) not in owner, f"{name_of[id(m)]} and {owner.get(id(sub))} overlap")
+            owner[id(sub)] = name_of[id(m)]
+    # A parameter shared with a module outside its unit (e.g. tied to lm_head) cannot move out of the root.
+    counts = collections.Counter(id(p) for _, p in model.named_parameters(remove_duplicate=False))
+    for m in units:
+        for n, p in m.named_parameters():
+            check(counts[id(p)] == 1, f"shared parameter {name_of[id(m)]}.{n}")
+    return [(name_of[id(m)], m) for m in units]
+
 
 def verbose_fsdp_grouping(model, prefix="", depth=0):
     indent = "    " * depth
@@ -91,6 +142,10 @@ def build_parallelize_model(
     use_depth_align: bool = False,
     split_fused_experts_from_decoder_fsdp: bool = False,
     vlm_fsdp: bool = False,
+    fsdp_split_root: bool = False,
+    fsdp_split_root_compile_vit: bool = False,
+    fsdp_split_root_prefetch: bool = False,
+    fsdp_split_action_out_proj: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -98,6 +153,21 @@ def build_parallelize_model(
     """
     parallel_state = get_parallel_state()
     fsdp_no_shard_states = None
+
+    split_root_options = {
+        "fsdp_split_root_compile_vit": fsdp_split_root_compile_vit,
+        "fsdp_split_root_prefetch": fsdp_split_root_prefetch,
+        "fsdp_split_action_out_proj": fsdp_split_action_out_proj,
+    }
+    if not fsdp_split_root and any(split_root_options.values()):
+        raise ValueError(f"{[k for k, v in split_root_options.items() if v]} require fsdp_split_root=True")
+    if fsdp_split_root:
+        if not (vlm_fsdp and parallel_state.dp_mode == "fsdp2" and not parallel_state.ep_enabled
+                and not parallel_state.tp_enabled):
+            raise ValueError(
+                f"fsdp_split_root requires vlm_fsdp=True, data_parallel_mode=fsdp2, no EP and no TP; got vlm_fsdp={vlm_fsdp}, "
+                f"dp_mode={parallel_state.dp_mode}, ep_enabled={parallel_state.ep_enabled}, tp_enabled={parallel_state.tp_enabled}"
+            )
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") != "cuda":
@@ -363,7 +433,57 @@ def build_parallelize_model(
                         logger.info_rank0(f"Apply FSDP2 to {layer.__class__.__name__}.")
                         fully_shard(layer, **mp_fsdp_kwargs)
 
+            if fsdp_split_root:
+                # bf16 params and fp32 gradient reduction like the root, but nothing cast at the new unit boundaries:
+                # inside the root nothing is cast today (e.g. the ViT blocks get fp32 RoPE cos/sin, which
+                # apply_rotary_pos_emb_vision computes with in fp32), so the forward stays bit-identical.
+                split_fsdp_kwargs = {
+                    "mesh": parallel_state.fsdp_mesh,
+                    "reshard_after_forward": enable_full_shard,
+                    "mp_policy": MixedPrecisionPolicy(
+                        param_dtype=torch.bfloat16,
+                        reduce_dtype=torch.float32,
+                        output_dtype=None,
+                        cast_forward_inputs=False,
+                    ),
+                }
+                units = _collect_split_root_units(model)
+                for _, unit in units:
+                    fully_shard(unit, **split_fsdp_kwargs)
+                logger.info_rank0(
+                    f"fsdp_split_root: {len(units)} units, "
+                    f"{sum(p.numel() for _, m in units for p in m.parameters()):,} params moved out of root"
+                )
+                if fsdp_split_root_compile_vit:
+                    # With FSDP hooks on the blocks, dynamo skips the ViT forward (the hooks graph-break inside its
+                    # block loop) and each block runs through torch.utils.checkpoint, which disables dynamo, so the
+                    # blocks run eager. Compile the block forward explicitly: one compiled function shared by the 24
+                    # blocks, whose guards do not depend on the instance (inline_inbuilt_nn_modules), so it compiles once.
+                    # (fully_shard has swapped each block's class for FSDPQwen3VLVisionBlock, which keeps its forward.)
+                    vit_blocks = list(model.model.qwenvl_with_expert.qwenvl.model.visual.blocks)
+                    compiled_block_forward = torch.compile(type(vit_blocks[0]).forward)
+                    for block in vit_blocks:
+                        block.forward = types.MethodType(compiled_block_forward, block)
+                    logger.info_rank0(f"fsdp_split_root_compile_vit: {len(vit_blocks)} ViT blocks run a torch.compile'd forward")
+                if fsdp_split_action_out_proj:
+                    # All of the root's FSDP padding comes from action_out_proj (weight [55, 768] and bias [55] pad to
+                    # 56 rows), so in its own unit the root AllGather becomes a multiple of 16 B. It takes the standard
+                    # policy (cast_forward_inputs=True): the dtype check before its call now reads the sharded fp32
+                    # weight and no longer casts suffix_out to bf16, so FSDP's pre-forward cast does it instead.
+                    if getattr(model.model.config, "action_fp32", False):  # _fp32_linear bypasses __call__ and the hooks
+                        raise ValueError("fsdp_split_action_out_proj requires action_fp32=False")
+                    fully_shard(model.model.action_out_proj, **mp_fsdp_kwargs)
+                    logger.info_rank0("fsdp_split_action_out_proj: action_out_proj is its own FSDP unit")
+
             fully_shard(model, **mp_fsdp_kwargs)
+            if fsdp_split_root_prefetch:
+                # Forward prefetch chain in call order: root -> ViT blocks (deepstack mergers after blocks 5, 11 and
+                # 17) -> merger -> embed_tokens. No backward prefetch: with reshard_after_forward=False these units are
+                # not all-gathered again in backward.
+                chain = [model] + [m for fqn, m in units if not fqn.endswith("_align_head")]
+                for cur, nxt in zip(chain, chain[1:]):
+                    cur.set_modules_to_forward_prefetch([nxt])
+                logger.info_rank0(f"fsdp_split_root_prefetch: forward prefetch chain of {len(chain)} FSDP units")
 
             if kwargs.get("init_device") == "meta":
                 if weights_path is None:
