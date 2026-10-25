@@ -19,8 +19,10 @@
 #   MEM_PROBE    1 (default) = run the trainer through mem_probe.py to record PyTorch
 #                allocated/reserved peaks per rank; 0 = launch the trainer directly
 #   NSYS_STEPS   e.g. 31-35: record an Nsight Systems timeline of these steps on rank 0
-#                ($OUT/nsys_rank0.nsys-rep); nsys ends the job after the last step.
+#                ($OUT/nsys_rank0.nsys-rep); the job ends after the last step. NSYS_ALL_RANKS=1
+#                records every rank instead ($OUT/nsys_allranks_rank<R>.nsys-rep, ~22 MB each).
 #                NSYS_ARGS adds nsys options, e.g. "--pytorch=autograd-nvtx" for op names
+#   ENTRY_WRAPPER a script that wraps the trainer entry and runs it with runpy (like mem_probe.py)
 # Extra arguments are passed to the trainer, e.g. `--train.optimizer muon` for plain Muon.
 set -euo pipefail
 NAME=${1:?usage: train.sh <run_name> [--key value ...]}; shift
@@ -28,6 +30,19 @@ NAME=${1:?usage: train.sh <run_name> [--key value ...]}; shift
 : "${DATA_LIST:?set DATA_LIST (see prepare_robotwin_clean.sh)}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PY=${PY:-python}
+# The trainer must run this checkout's code. A conda env can carry an editable install of another
+# checkout, and python then imports that one without a word, so check where the packages resolve.
+(cd / && "$PY" - "$REPO" <<'EOF'
+import importlib.util, os, sys
+repo = os.path.realpath(sys.argv[1]) + os.sep
+for name in ("lingbotvla", "moge", "mdm"):
+    spec = importlib.util.find_spec(name)
+    paths = [p for p in [spec.origin, *(spec.submodule_search_locations or [])] if p and os.path.isabs(p)] if spec else []
+    if not paths or not all(os.path.realpath(p).startswith(repo) for p in paths):
+        sys.exit(f"{sys.executable} imports {name} from {paths or 'nowhere'}, not from {repo}; "
+                 "use an env whose editable installs point at this checkout")
+EOF
+)
 NPROC=${NPROC:-8} MICRO=${MICRO:-16} GA=${GA:-2}
 GLOBAL=$((MICRO * GA * NPROC))
 MAX_STEPS=${MAX_STEPS:-5000} SAVE_STEPS=${SAVE_STEPS:-2500} TIMING_ONLY=${TIMING_ONLY:-0}
@@ -64,11 +79,21 @@ if [ "$MEM_PROBE" = 1 ]; then
   ENTRY=(experiment/single_node_repro/mem_probe.py "${ENTRY[@]}")
   export MEM_PROBE_DIR=$OUT
 fi
+if [ -n "${ENTRY_WRAPPER:-}" ]; then
+  # a script that runs the next entry with runpy, like mem_probe.py (e.g. to capture tensors for an offline check)
+  ENTRY=("$ENTRY_WRAPPER" "${ENTRY[@]}")
+fi
 RUNNER=()
 if [ -n "${NSYS_STEPS:-}" ]; then
   ENTRY=(experiment/single_node_repro/nsys_probe.py "${ENTRY[@]}")
-  RUNNER=(--no-python bash experiment/single_node_repro/nsys_rank0.sh "$PY")
-  export NSYS_STEPS NSYS_OUT=$OUT/nsys_rank0
+  if [ "${NSYS_ALL_RANKS:-0}" = 1 ]; then NSYS_RUNNER=nsys_allranks; else NSYS_RUNNER=nsys_rank0; fi
+  RUNNER=(--no-python bash "experiment/single_node_repro/$NSYS_RUNNER.sh" "$PY")
+  export NSYS_STEPS NSYS_OUT=$OUT/$NSYS_RUNNER
+fi
+if [ "$TIMING_ONLY" = 1 ]; then
+  # The trainer starts writing its final checkpoint (~50-74 GB) the moment the last step ends,
+  # long before the kill below lands, so tell it to skip that checkpoint.
+  export LINGBOT_SKIP_FINAL_CKPT=1
 fi
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 # Per-second GPU memory, utilization, temperature and thermal throttling; summarize_run.py
