@@ -124,6 +124,12 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
     def __init__(self, config: QwenvlWithExpertV2Config, eval=False):
         super().__init__(config=config)
         self.config = config
+        if getattr(self.config, "attention_dtype", "fp32") not in ("fp32", "bf16"):
+            raise ValueError(f"attention_dtype must be fp32 or bf16, got {self.config.attention_dtype}")
+        if getattr(self.config, "attention_dtype", "fp32") == "bf16" and not (
+            getattr(self.config, "fused_joint_qkv_prep", False) and getattr(self.config, "fused_joint_attn_split", False)
+        ):
+            raise ValueError("attention_dtype=bf16 requires fused_joint_qkv_prep and fused_joint_attn_split")
         vlm_config = AutoConfig.from_pretrained(self.config.tokenizer_path)
         if self.config.vocab_size not in (0, 257152):
             vlm_config.text_config.vocab_size = self.config.vocab_size
@@ -351,6 +357,14 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
             rope_cos, rope_sin = self.qwenvl.model.language_model.rotary_emb(
                 torch.empty(0, dtype=torch.float32, device=position_ids.device), position_ids
             )
+        # --train.fused_joint_attn_split (needs the fused prep): one Triton kernel per direction splits the flex output
+        # into each stream's own attention input (lingbotvla/ops/joint_attn_split.py)
+        use_split = use_fused and getattr(self.config, "fused_joint_attn_split", False)
+        if use_split:
+            from lingbotvla.ops.joint_attn_split import joint_attn_split
+        # --train.attention_dtype bf16 (needs both of the above): joint_qkv_prep writes bf16 Q/K/V, flex runs in bf16,
+        # and the split returns the expert part in the expert's own dtype
+        attn_dtype = torch.bfloat16 if getattr(self.config, "attention_dtype", "fp32") == "bf16" else torch.float32
 
         for layer_idx in range(num_layers):
             query_states = []
@@ -375,9 +389,9 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
 
             if use_fused:
                 (q_v, k_v, v_v), (q_e, k_e, v_e) = qkv_raw
-                # fp32 [B, Hq|Hkv, L, D], L = Lv + Le not padded to the flex block size
+                # attn_dtype [B, Hq|Hkv, L, D], L = Lv + Le not padded to the flex block size
                 query_states, key_states, value_states = joint_qkv_prep(
-                    q_v, k_v, v_v, q_e, k_e, v_e, rope_cos, rope_sin
+                    q_v, k_v, v_v, q_e, k_e, v_e, rope_cos, rope_sin, out_dtype=attn_dtype
                 )
                 if layer_idx == 0:
                     _full_len = query_states.shape[2]
@@ -388,7 +402,19 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                         _full_len,
                         pad_to_block=False,
                     )
-                att_output = flex_attention_prepared(query_states, key_states, value_states, _full_block_mask)
+                att_output = flex_attention_prepared(
+                    query_states, key_states, value_states, _full_block_mask, raw_output=use_split
+                )
+                if use_split:
+                    # [B, Hq, L, D] -> the VLM part [B, Lv, Hq*D] in the VLM hidden dtype (bf16) and the expert part
+                    # [B, Le, Hq*D] in the dtype of the expert's q/k/v (fp32), so the layers' cast and slice of their
+                    # attention input are no-ops. Not inputs_embeds[1].dtype: the expert's input to layer 0 is bf16
+                    # (embed_suffix), while its layers compute and always got their attention part in fp32; with an
+                    # fp32 attention that is O's dtype, as before.
+                    att_parts = joint_attn_split(
+                        att_output, inputs_embeds[0].shape[1], inputs_embeds[1].shape[1],
+                        vlm_dtype=inputs_embeds[0].dtype, exp_dtype=q_e.dtype,
+                    )
             else:
                 query_states = torch.cat(query_states, dim=1)
                 key_states = torch.cat(key_states, dim=1)
@@ -424,12 +450,17 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                     outputs_embeds.append(None)
                     continue
                 end = start + hidden_states.shape[1]
+                layer_att_output = att_output
+                layer_start, layer_end = start, end
+                if use_split:
+                    # this stream's own part of the attention output: start/end cover all of it
+                    layer_att_output, layer_start, layer_end = att_parts[i], 0, hidden_states.shape[1]
                 if i == 1:
                     out_emb, router_logits = models[i].layers[layer_idx](
                         hidden_states,
-                        att_output,
-                        start,
-                        end,
+                        layer_att_output,
+                        layer_start,
+                        layer_end,
                         output_atten=True,
                         ada_cond=ada_cond,
                     )
@@ -437,7 +468,7 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
                         router_logits_list.append(router_logits)
                 else:
                     out_emb = models[i].layers[layer_idx](
-                        hidden_states, att_output, start, end, output_atten=True
+                        hidden_states, layer_att_output, layer_start, layer_end, output_atten=True
                     )
                     out_emb = self._apply_deepstack(out_emb, layer_idx, visual_pos_masks, deepstack_visual_embeds)
                 outputs_embeds.append(out_emb)
@@ -493,6 +524,8 @@ class FlowMatchingV2(FlowMatchingV1):
             "final_norm_adanorm",
             "precompute_grid_thw",
             "fused_joint_qkv_prep",
+            "fused_joint_attn_split",
+            "attention_dtype",
             "vit_attn_implementation",
             "use_moe",
             "bias_update_speed",
