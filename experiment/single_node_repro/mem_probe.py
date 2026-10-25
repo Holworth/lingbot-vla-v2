@@ -2,11 +2,12 @@
 
     torchrun ... experiment/single_node_repro/mem_probe.py tasks/vla/train_lingbotvla.py <args>
 
-The trainer computes max_memory_allocated/reserved but never logs them, so this wrapper
-samples them from a background thread and resets the peak after each sample. Each row of
-$MEM_PROBE_DIR/mem_rank<R>.csv is "unix_time,allocated_peak_bytes,reserved_peak_bytes" for
-the preceding second. The trainer itself runs unchanged (it never reads these peaks for
-anything but an unlogged metric).
+The trainer logs max_memory_allocated only in its "VRAM usage after building model / after
+epoch N" lines, so this wrapper samples the peaks from a background thread and resets them after
+each sample. Each row of $MEM_PROBE_DIR/mem_rank<R>.csv is
+"unix_time,allocated_peak_bytes,reserved_peak_bytes" for the preceding second. The trainer itself
+runs unchanged, but because of the resets its own "max" lines then report the peak of the last
+second, not of the run: use mem_rank<R>.csv for peaks.
 """
 
 import os

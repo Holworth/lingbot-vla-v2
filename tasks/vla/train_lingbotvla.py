@@ -36,6 +36,7 @@ from lingbotvla.utils import helper
 from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from lingbotvla.utils.dist_utils import all_reduce
+from lingbotvla.utils.state_hash import dump_params, dump_state_hash, steps_from_env
 from lingbotvla.models.config_registry import get_config_registry
 
 from lingbotvla.models.vla.vision_models.module_utils import (
@@ -489,6 +490,8 @@ def main():
         vlm_fsdp=args.train.vlm_fsdp,
         use_future_image=args.data.use_future_image,
     )
+    state_hash_steps = steps_from_env("LINGBOT_STATE_HASH_STEPS")  # debug hooks for bit-exact run comparisons
+    params_dump_steps = steps_from_env("LINGBOT_PARAMS_DUMP_STEPS")
     logger.info_rank0(model)
     if args.train.use_compile:
         model = torch.compile(model)
@@ -888,8 +891,14 @@ def main():
                 grad_norm = ep_fsdp2_clip_grad_norm(model, max_grad_norm)
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, foreach=True)
+            if global_step in state_hash_steps:  # LINGBOT_STATE_HASH_STEPS (debug): gradients after clip, before the update
+                dump_state_hash(model, global_step, args.train.global_rank, args.train.output_dir, "grad")
 
             optimizer.step()
+            if global_step in state_hash_steps:
+                dump_state_hash(model, global_step, args.train.global_rank, args.train.output_dir, "param")
+            if global_step in params_dump_steps:  # LINGBOT_PARAMS_DUMP_STEPS (debug): fp32 local shards after the update
+                dump_params(model, global_step, args.train.global_rank, args.train.output_dir)
             lr_scheduler.step()
             optimizer.zero_grad()
             if hasattr(grad_norm, "full_tensor"):
@@ -1134,7 +1143,9 @@ def main():
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
         if reached_max_steps:
             already_saved = args.train.save_steps and global_step % args.train.save_steps == 0
-            if not already_saved:
+            # Set by experiment/single_node_repro/train.sh for timing runs (TIMING_ONLY=1).
+            skip_final_checkpoint = os.environ.get("LINGBOT_SKIP_FINAL_CKPT") == "1"
+            if not already_saved and not skip_final_checkpoint:
                 helper.empty_cache()
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
                 state = {

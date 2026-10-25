@@ -63,6 +63,23 @@ if conda env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
   ENV_EXISTS=1
 fi
 
+# A same-named env can belong to another checkout of this repo (its editable lingbotvla points
+# there). Never install into or remove such an env from here.
+# conda resolves the name in any envs dir, so check the prefix it would use, not only ${ENV_PREFIX}.
+FOUND_PREFIX="$(conda env list | awk -v n="${ENV_NAME}" '$1 == n {print $NF; exit}')"
+if [[ ("${ENV_EXISTS}" == "1" || -d "${ENV_PREFIX}") && ("${RECREATE}" == "1" || "${RESUME}" == "1") ]]; then
+  for FINDER in "${FOUND_PREFIX:-${ENV_PREFIX}}"/lib/python3*/site-packages/__editable___lingbotvla_*_finder.py \
+                "${ENV_PREFIX}"/lib/python3*/site-packages/__editable___lingbotvla_*_finder.py; do
+    [[ -f "${FINDER}" ]] || continue
+    OWNER="$(sed -n "s/^MAPPING.*'lingbotvla': '\([^']*\)'.*/\1/p" "${FINDER}")"
+    if [[ -n "${OWNER}" && "$(realpath -m "${OWNER}")" != "$(realpath -m "${REPO_ROOT}/lingbotvla")" ]]; then
+      echo "Conda env ${ENV_NAME} belongs to another checkout: it imports lingbotvla from ${OWNER}" >&2
+      echo "Refusing to install into or remove it. Pass --env-name with a different name." >&2
+      exit 1
+    fi
+  done
+fi
+
 if [[ "${ENV_EXISTS}" == "1" || -d "${ENV_PREFIX}" ]]; then
   if [[ "${RECREATE}" == "1" ]]; then
     if [[ "${ENV_EXISTS}" == "1" ]]; then

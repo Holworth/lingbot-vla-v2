@@ -1,7 +1,7 @@
 # 单机 8 卡复现：RoboTwin 2.0 clean 后训练（Distributed Muon / Muon；H20 与 RTX PRO 5000）
 
 用官方代码和官方 `configs/vla/robotwin/robotwin_dist_muon.yaml`，在单台 8 卡机器（8×H20、8×RTX PRO 5000）上复现 RoboTwin 2.0 clean 数据的后训练速度和 loss。
-训练代码没有任何修改：本目录的脚本只负责下载权重、准备数据、填写配置里的路径，以及统计耗时。
+本目录的脚本只负责下载权重、准备数据、填写配置里的路径，以及统计耗时。下面的结果是用未修改的官方训练代码测的；其中 `TIMING_ONLY=1`（跳过最后的 checkpoint）需要本仓库训练脚本里的 `LINGBOT_SKIP_FINAL_CKPT`，在官方提交上会被忽略。
 
 ## 结果
 
@@ -65,7 +65,7 @@ git checkout be969b8fd117fb70550c5d4bf4bc328211b5b1b6   # 复现用的官方提�
 bash tools/create_train_env.sh                          # 官方环境脚本，创建 conda 环境 lingbotvla
 ```
 
-把本目录（`experiment/single_node_repro/`）放进上面的仓库，或者直接 clone 本 fork 的 `single-node-repro` 分支，二者等价。
+把本目录（`experiment/single_node_repro/`）放进上面的仓库即可复现速度和 loss。`TIMING_ONLY=1` 在官方提交上不会跳过最后的 checkpoint（脚本会在它写到一半时结束进程），这一项需要本仓库的训练脚本。
 
 ## 1. 下载权重（约 36 GB）
 
@@ -179,9 +179,9 @@ MAX_STEPS=130 TIMING_ONLY=1 OPTIMIZER=muon      bash experiment/single_node_repr
 
 ### 抓 timeline（profiling）
 
-两种方式都只抓 rank 0 的几个预热后的 step，训练代码不改。
+两种方式都只抓几个预热后的 step。
 
-**Nsight Systems（`.nsys-rep`，用 Nsight Systems 桌面端打开）**：设置 `NSYS_STEPS` 即可，录完最后一步后 nsys 会结束任务，报告在 `$OUT_ROOT/<run_name>/nsys_rank0.nsys-rep`。
+**Nsight Systems（`.nsys-rep`，用 Nsight Systems 桌面端打开）**：设置 `NSYS_STEPS` 即可，录完最后一步后任务结束，报告在 `$OUT_ROOT/<run_name>/nsys_rank0.nsys-rep`（只录 rank 0，即 GPU 0，GPU metrics 也只录这张卡，约 30 MB；加 `NSYS_ALL_RANKS=1` 则每个 rank 一个报告 `nsys_allranks_rank<R>.nsys-rep`）。
 
 ```bash
 MAX_STEPS=45 TIMING_ONLY=1 MEM_PROBE=0 NSYS_STEPS=31-35 OPTIMIZER=dist_muon \
@@ -217,7 +217,66 @@ MAX_STEPS=36 TIMING_ONLY=1 MEM_PROBE=0 OPTIMIZER=dist_muon \
 | 其中 NCCL / 未被计算重叠的部分 | 173 / 51 ms | 634 / 634 ms |
 
 - 两者每步相差约 2.1 s，全部来自 `optimizer.step`：Muon 在每个 rank 上对所有矩阵算 Newton-Schulz，再做一次 all-gather；DistMuon 把这部分分摊到各卡。
-- 前向 + 反向里，FSDP 的 all-gather 和 reduce-scatter 每步共约 2.5 s，其中约 0.85 s 没被计算重叠。NCCL 在这台只有 PCIe 的机器上选的是 `RING_LL` 协议。
+- 前向 + 反向里，FSDP 的 all-gather 和 reduce-scatter 每步共约 2.5 s，其中约 0.85 s 没被计算重叠。
+- timeline 里 NCCL kernel 名字带 `RING_LL`，但在 NCCL 2.27 里 kernel 名字不代表实际协议。`NCCL_DEBUG_SUBSYS=TUNING` 的日志显示，大消息实际用的是 RING + SIMPLE，见下一节。
+
+### 通信带宽与 NCCL 设置（8×RTX PRO 5000）
+
+`coll_bw.py` 只测 all-gather / reduce-scatter 的带宽，不跑训练。带宽按 nccl-tests 的 busbw 定义计算（数据量 ÷ 时间 × 7/8）。另一种常见口径 algbw（数据量 ÷ 时间）在 8 卡上是 busbw 的 8/7 倍，对比别处的数字时先确认口径。
+
+```bash
+torchrun --nproc_per_node 8 experiment/single_node_repro/coll_bw.py
+# 查看 NCCL 实际选的通道数、连接方式、算法和协议
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING torchrun --nproc_per_node 8 experiment/single_node_repro/coll_bw.py
+```
+
+**测试机（机器 A）的硬件和连接**：
+
+- CPU：2 × AMD EPYC 9575F（64 核），2 个 NUMA 节点。GPU 0–3 在 NUMA 0，GPU 4–7 在 NUMA 1。
+- GPU：8 × RTX PRO 5000 72GB，每张 PCIe Gen5 x16，没有 NVLink。驱动 580.95.05。
+- 网卡：4 块 ConnectX-8（每块 2 个 400 Gb/s 端口），每块内置 PCIe 交换，下面挂 2 张 GPU（0-1、2-3、4-5、6-7）。
+- NCCL 2.27.3（PyTorch 2.8.0+cu128 自带），没有设置任何 `NCCL_*` 环境变量，也没有 `/etc/nccl.conf`。NCCL 的连接方式：
+  - 同一块 ConnectX-8 下的两张卡（如 0↔1）：`P2P/CUMEM`，经 PCIe 交换直连。
+  - 同一 NUMA、不同 ConnectX-8 的卡（如 1↔2）：`SHM`，经 CPU 内存中转。
+  - 跨 NUMA（如 3↔4）：NCCL 把整机当成 2 个节点 × 4 卡（`nNodes 2 localRanks 4`），走网卡加 GPU 直连（`NET/IB/GDRDMA`），不经过两个 CPU 之间的链路。
+- NCCL 默认选择：4 个通道（`4 coll channels`），每个通道 512 个线程（NCCL 的默认值，日志里不打印），RING + SIMPLE。
+
+**不同 NCCL 设置的带宽**（1–2 GB 消息的稳定值，bf16 和 fp32 一样）：
+
+| 配置 | 通道 | 每通道线程 | all-gather busbw | reduce-scatter busbw |
+|---|---|---|---:|---:|
+| 默认 | 4 | 512 | 25.8 GB/s | 25.6 GB/s |
+| `NCCL_MIN_CTAS=8` | 8 | 512 | 26.0 GB/s | 26.2 GB/s |
+| `NCCL_NTHREADS=128` | 4 | 128 | 23.0 GB/s | 17.7 GB/s |
+| `NCCL_MIN_CTAS=8 NCCL_NTHREADS=128` | 8 | 128 | 24.9 GB/s | 23.5 GB/s |
+| `NCCL_PROTO=LL` | 4 | — | 约 9 GB/s | 约 9 GB/s |
+
+- 在这台机器上，默认 4 个通道已经把链路跑满。加到 8 个通道几乎没有变化（约 +1%）。
+- 每通道线程减到 128 会变慢，reduce-scatter 掉得最多（约 −30%）。原因是 reduce-scatter 除了搬数据还要做加法，线程少了跟不上。
+- 两个一起改时，8 个通道补回了一部分，但仍比默认略慢。
+- 结论：这台机器用 NCCL 默认设置即可。同一组 NCCL 设置在不同机器上效果可以完全不同，取决于各段连接的方式（`P2P` / `SHM` / `NET`）和 NCCL 默认选的通道数。
+
+**不同 8×RTX PRO 5000 机器的 DistMuon 速度**（micro 32 × 8 × GA 1，开激活重算）：
+
+| | A（本复现） | B（默认） | B（调 NCCL） | C |
+|---|---|---|---|---|
+| CPU / NUMA | 2 × AMD EPYC 9575F，2 个 NUMA | 未提供 | 同左 | 未提供，2 个 NUMA |
+| GPU 连接 | PCIe Gen5，无 NVLink；每 2 张卡共用一块 ConnectX-8 的 PCIe 交换 | 未提供 | 同左 | PCIe，无 NVLink；8 卡分在 2 个 NUMA |
+| 跨 NUMA 通信 | 网卡 + GPU 直连（`NET/IB/GDRDMA`） | 未提供 | 同左 | 未提供 |
+| NCCL 版本 | 2.27.3 | 未提供 | 同左 | 2.27.3 |
+| NCCL 环境变量 | 无 | 无 | `NCCL_MIN_CTAS=8`<br>`NCCL_NTHREADS=128`<br>并 unset `NCCL_MIN/MAX_NCHANNELS`、`NCCL_MIN/MAX_NRINGS`、`NCCL_ALGO`、`NCCL_PROTO`、`NCCL_THREAD_THRESHOLDS` | 未提供 |
+| NCCL 实际通道 × 每通道线程 | 4 × 512 | 未提供 | 8 × 128 | 未提供 |
+| all-gather / reduce-scatter 带宽 | 25.8 / 25.6 GB/s（busbw） | 未测 | 未测 | 约 29 / 20 GB/s（口径未知） |
+| 代码 | 本分支 | 本分支 | 本分支 | 更早的版本；优化器通信先转 BF16 |
+| step 耗时 | **4.767 s** | **5.567 s** | **约 4.66 s** | **5.350 s** |
+
+- 同样的代码，机器 B 用默认 NCCL 设置时比 A 慢约 0.8 s/步，改 NCCL 设置后与 A 相当，差距都在通信上；在 A 上同样的设置反而略慢（见上一张表）。
+- 机器之间的速度差主要来自各自 NCCL 默认设置能否用满链路。换机器时，先用 `coll_bw.py` 和 `NCCL_DEBUG=INFO` 看带宽、通道数和每段连接的方式，再决定要不要调 NCCL 设置。
+
+**优化器通信改成 BF16**：官方 DistMuon（`lingbotvla/optim/flex_shard/dist_muon.py`）每步要在卡之间做两次 all-to-all：先把动量更新后的梯度发到负责计算的卡上，算完 Newton-Schulz 后再把更新方向发回去，两次都按参数的 dtype（FP32）传输。
+
+- Newton-Schulz 的第一步就把输入转成 BF16（`_zeropower_via_newtonschulz`），输出本身也是 BF16，只是写回 FP32 缓冲区。所以两次通信都先转 BF16，数值与原来完全相同，通信量减半。
+- 本测试机的 timeline 里，`DistMuon.step` 每步 288 ms，其中 all-to-all（`SendRecv` kernel）约 158 ms。改成 BF16 预计最多省约 80 ms/步（约 1.7%），在带宽更低的机器上省得更多。尚未实现和测试。
 
 ## 5. 与官方的差异
 
@@ -238,6 +297,8 @@ MAX_STEPS=36 TIMING_ONLY=1 MEM_PROBE=0 OPTIMIZER=dist_muon \
 | `train_pro5000.sh` | RTX PRO 5000 的设置：micro 32、GA 1、打开激活重算，用 `OPTIMIZER` 选 dist_muon 或 muon |
 | `mem_probe.py` | 启动包装：训练代码不改，每秒记录各卡 PyTorch 显存峰值 |
 | `nsys_probe.py` | 启动包装：训练代码不改，标出 step 和 optimizer.step 的 NVTX 区间，并在指定 step 开关 nsys 录制 |
-| `nsys_rank0.sh` | `NSYS_STEPS` 打开时由 torchrun 调用：rank 0 在 nsys 下运行，其他 rank 正常运行 |
+| `nsys_rank0.sh` | `NSYS_STEPS` 打开时由 torchrun 调用：rank 0 在 nsys 下运行（只录 CUDA 和 NVTX，GPU metrics 只录 rank 0 的卡，按 PCI 地址找 nsys 的设备号），其他 rank 正常运行（默认） |
+| `nsys_allranks.sh` | 同上，`NSYS_ALL_RANKS=1` 时用：每个 rank 都在 nsys 下运行，rank 0 另录 8 张卡的 GPU metrics |
+| `coll_bw.py` | 测 all-gather / reduce-scatter 带宽，用来比较 NCCL 设置和不同机器 |
 | `summarize_run.py` | 统计 step 耗时、墙钟、loss、显存峰值，并标出过热降频的 GPU |
 | `figures/` | 8 张结果和参考图，见"结果 → 图" |
