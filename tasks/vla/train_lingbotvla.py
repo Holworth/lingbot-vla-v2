@@ -47,6 +47,7 @@ from lingbotvla.models.vla.vision_models.module_utils import (
     log_video,
 )
 from lingbotvla.models.vla.lingbot_vla.moe_load_balance import build_moe_load_balance_hook
+from lingbotvla.ops import moe_glue
 import gc
 gc.set_threshold(50000, 50, 50)
 
@@ -337,6 +338,10 @@ class MyTrainingArguments(TrainingArguments):
         default=1,
         metadata={"help": "Max number of FSDP2 reduce-scatters in flight in backward (1 = FSDP2 default: the compute stream waits for the previous reduce-scatter before issuing the next)."},
     )
+    moe_glue_opt: bool = field(
+        default=False,
+        metadata={"help": "MoE glue kernels (lingbotvla/ops/moe_glue.py): fp32 expert weights cast inside the grouped GEMMs and fp32 wgrad (LINGBOT_MOE_FP32_WEIGHTS=0 disables), counting sort instead of two argsorts (LINGBOT_MOE_COUNTING_SORT=0), one Triton kernel for the routing tail after top-k (LINGBOT_MOE_COMPILE_ROUTER=0)."},
+    )
 
 @dataclass
 class MyDataArguments(DataArguments):
@@ -463,6 +468,10 @@ def main():
         if n_patched != n_layers:
             raise ValueError(f"fused_swiglu: patched {n_patched} Qwen3VLTextMLP modules, expected {n_layers}")
         logger.info_rank0(f"fused_swiglu: patched {n_patched} Qwen3VLTextMLP modules")
+    if args.train.moe_glue_opt:
+        from lingbotvla.ops.moe_glue import apply_moe_glue
+        moe_glue_opts, n_blocks = apply_moe_glue(model)
+        logger.info_rank0(f"moe_glue_opt: {n_blocks} MoE blocks, {moe_glue_opts}")
     use_depth_align = True if args.train.align_params != {} else False
     use_future_depth = args.train.align_params.get('depth', {}).get('use_future_depth', False)
     use_future_video = use_depth_align and args.train.align_params.get('use_future_video', False)
@@ -876,6 +885,8 @@ def main():
 
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
+            if moe_glue.DUMP_STEPS:  # LINGBOT_MOE_ROUTING_DUMP_STEPS (debug)
+                moe_glue.routing_dump_begin(global_step)
 
             total_loss, total_vla_loss, total_depth_loss, total_future_depth_loss, total_future_video_loss, total_seq_wise_loss, total_router_z_loss = 0, 0, 0, 0, 0, 0, 0
             depth_targets, depth_preds = None, None
@@ -1001,6 +1012,8 @@ def main():
                 if not (isinstance(router_z_loss, int) or isinstance(router_z_loss, float)):
                     total_router_z_loss += router_z_loss.item() / len(micro_batches)
                 del micro_batch
+            if moe_glue.DUMP:
+                moe_glue.routing_dump_end(global_step, args.train.global_rank, args.train.output_dir)
             # --- TEMP gate-gradient probe (GATE_GRAD_PROBE=1): dump router gate grad
             # magnitude vs routed-expert grad, plus per-expert symmetry, pre-clip. ---
             if os.environ.get("GATE_GRAD_PROBE") and global_step < 12:
@@ -1074,6 +1087,8 @@ def main():
                 expert_lr = None
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
             data_loader_tqdm.update()
+            if moe_glue.CHECK and args.train.global_rank == 0:  # LINGBOT_MOE_GLUE_CHECK (debug)
+                logger.info(f"moe_glue check, step {global_step}: {moe_glue.check_report() or 'nothing checked'}")
             expert_lr_str = f"Expert_LR {expert_lr:.2e}, " if expert_lr is not None else ""
             maxvio_val = loss_log.get("moe_summary/maxvio_avg", loss_log.get("token_moe/avg_maxvio", None))
             maxvio_str = f"MaxVio {maxvio_val.item() if torch.is_tensor(maxvio_val) else maxvio_val:.4f}, " if maxvio_val is not None else ""
