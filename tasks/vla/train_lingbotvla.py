@@ -313,15 +313,15 @@ class MyTrainingArguments(TrainingArguments):
     )
     fsdp_no_reshard_after_backward: bool = field(
         default=False,
-        metadata={"help": "Keep layer parameters unsharded through backward (no re-all-gather for the second call of each joint layer); reshard explicitly after backward. Meant for enable_full_shard=false (rejected otherwise)."},
+        metadata={"help": "Keep layer parameters unsharded through backward (no re-all-gather for the second call of each joint layer); reshard explicitly after backward. Needs enable_full_shard=false, like the other fsdp_* scheduling switches."},
     )
     fsdp_forward_prefetch_depth: int = field(
         default=0,
-        metadata={"help": "All-gather the first k joint layers at step start (before the teacher phase) and keep a lookahead of k layers in the layer loop. 0 = FSDP default."},
+        metadata={"help": "All-gather the first k joint layers before the forward of every micro-batch (see fsdp_prologue_under) and keep a lookahead of k layers in the layer loop. 0 = FSDP default."},
     )
     fsdp_prologue_under: str = field(
         default="teacher",
-        metadata={"help": "Where the fsdp_forward_prefetch_depth prologue runs: 'teacher' = at step start, its all-gathers overlap the teacher models; 'vit' = right before the model forward, after all-gathering the units the forward calls before the layers (root, ViT, embed_tokens, task projections) in call order, so the layers' all-gathers overlap the ViT / prefix compute and the teacher phase is not needed (use it with teacher_cache_mode=read)."},
+        metadata={"help": "Where the fsdp_forward_prefetch_depth prologue runs: 'teacher' = at the start of every micro-batch, its all-gathers overlap the online teacher models; 'vit' = right before the model forward, after all-gathering the units the forward calls before the layers (root, ViT, embed_tokens, task projections) in call order, so the layers' all-gathers overlap the ViT / prefix compute and the teacher phase is not needed (use it with teacher_cache_mode=read)."},
     )
     fsdp_rs_inflight_depth: int = field(
         default=1,
@@ -627,58 +627,71 @@ def main():
         raise ValueError(f"fsdp_prologue_under must be 'teacher' or 'vit', got {args.train.fsdp_prologue_under!r}")
     if args.train.fsdp_prologue_under == "vit" and args.train.fsdp_forward_prefetch_depth == 0:
         raise ValueError("fsdp_prologue_under=vit requires fsdp_forward_prefetch_depth > 0")
-    if args.train.fsdp_forward_prefetch_depth > 0 and args.train.fsdp_prologue_under == "teacher" and teacher_cache_mode == "read":
-        logger.warning_rank0("fsdp_prologue_under=teacher with teacher_cache_mode=read: no teacher runs, so the prologue's "
-                            "layer all-gathers queue ahead of the ViT's; use fsdp_prologue_under=vit")
+    if args.train.fsdp_forward_prefetch_depth > 0 and args.train.fsdp_prologue_under == "teacher" and (
+            not use_depth_align or teacher_cache_mode == "read"):
+        logger.warning_rank0(f"fsdp_prologue_under=teacher but no teacher model runs before the forward "
+                             f"({'teacher_cache_mode=read' if use_depth_align else 'no depth alignment'}): the prologue's "
+                             f"layer all-gathers queue ahead of the ViT's; use fsdp_prologue_under=vit")
     if args.train.fsdp_forward_prefetch_depth < 0 or args.train.fsdp_rs_inflight_depth < 1:
         raise ValueError(f"need fsdp_forward_prefetch_depth >= 0 and fsdp_rs_inflight_depth >= 1, got "
                          f"{args.train.fsdp_forward_prefetch_depth} and {args.train.fsdp_rs_inflight_depth}")
-    if args.train.fsdp_no_reshard_after_backward and args.train.enable_full_shard:
-        # with reshard_after_forward every layer would stay unsharded from its first backward all-gather until
-        # after the backward (~13 GiB per rank here) instead of only through the backward of its two calls
-        raise ValueError("fsdp_no_reshard_after_backward is meant for enable_full_shard=false")
+    if args.train.enable_full_shard and (args.train.fsdp_no_reshard_after_backward or args.train.fsdp_forward_prefetch_depth > 0
+                                         or args.train.fsdp_rs_inflight_depth > 1):
+        # With reshard_after_forward, no re-gather would keep every layer unsharded from its first backward all-gather
+        # until after the backward (~13 GiB per rank here). Prefetch and reduce-scatters in flight were measured with full
+        # shard too: no speedup, ~2.4 GiB more reserved memory, and with both on the VLM gradients vary from run to run.
+        raise ValueError("fsdp_no_reshard_after_backward / fsdp_forward_prefetch_depth / fsdp_rs_inflight_depth "
+                         "require enable_full_shard=false")
     if args.train.fsdp_no_reshard_after_backward or args.train.fsdp_forward_prefetch_depth > 0 or args.train.fsdp_rs_inflight_depth > 1:
         if args.train.data_parallel_mode != "fsdp2":
             raise ValueError("layer comm scheduling (fsdp_no_reshard_after_backward / fsdp_forward_prefetch_depth / "
                              "fsdp_rs_inflight_depth) is FSDP2-only")
         from torch.distributed.fsdp import FSDPModule
         from lingbotvla.distributed.fsdp_layer_comm import LayerCommScheduler
+        from lingbotvla.distributed.torch_parallelize import _resolve
         core = model.model.qwenvl_with_expert
+        # the module paths build_parallelize_model shards (Qwen3-VL, Qwen2.5-VL, legacy layout)
+        llm_layers, _ = _resolve(core.qwenvl, [("model", "language_model", "layers"), ("model", "layers"),
+                                               ("language_model", "model", "layers")])
+        if llm_layers is None:
+            raise RuntimeError("layer comm scheduling: could not locate the Qwen-VL decoder layers")
         prefix_units = None
         if args.train.fsdp_prologue_under == "vit":
             # The FSDP units the forward all-gathers before the layer loop, in call order (embed_prefix): the root, the
             # ViT (its parent unit owns pos_embed; then patch_embed, the blocks with the deepstack mergers after their
-            # blocks, the merger), embed_tokens and the two shared task projections. A module that is not an FSDP unit
-            # belongs to an enclosing unit and is skipped.
-            visual = core.qwenvl.model.visual
+            # blocks, the merger), embed_tokens and the two shared task projections, as build_parallelize_model shards
+            # them. A module that is not an FSDP unit belongs to an enclosing unit and is skipped.
+            visual, _ = _resolve(core.qwenvl, [("model", "visual"), ("visual",)])
+            embed_tokens, _ = _resolve(core.qwenvl, [("model", "language_model", "embed_tokens"), ("model", "embed_tokens"),
+                                                     ("language_model", "model", "embed_tokens")])
+            if visual is None or embed_tokens is None:
+                raise RuntimeError("fsdp_prologue_under=vit: could not locate the Qwen-VL vision tower / token embedding")
             deepstack_at = list(getattr(visual, "deepstack_visual_indexes", []))
             candidates = [model, visual, getattr(visual, "patch_embed", None)]
             for j, block in enumerate(visual.blocks):
                 candidates.append(block)
                 if j in deepstack_at:
                     candidates.append(visual.deepstack_merger_list[deepstack_at.index(j)])
-            candidates += [getattr(visual, "merger", None), core.qwenvl.model.language_model.embed_tokens,
+            candidates += [getattr(visual, "merger", None), embed_tokens,
                            getattr(model.model, "current_shared_task_proj", None),
                            getattr(model.model, "future_shared_task_proj", None)]
             prefix_units = [m for m in candidates if isinstance(m, FSDPModule)]
         layer_comm = LayerCommScheduler(
-            list(core.qwenvl.model.language_model.layers),
+            list(llm_layers),
             list(core.qwen_expert.model.layers),
             prefetch_depth=args.train.fsdp_forward_prefetch_depth,
             no_reshard_after_backward=args.train.fsdp_no_reshard_after_backward,
             prefix_units=prefix_units,
             rs_inflight_depth=args.train.fsdp_rs_inflight_depth,
         )
-        layer_comm.configure()
-        if layer_comm.rs_inflight is not None:
-            # the post_backward patch applies to every FSDP2 unit, not only the layers: check all of them
-            layer_comm.rs_inflight.check([m._get_fsdp_state()._fsdp_param_group for m in model.modules()
-                                          if isinstance(m, FSDPModule) and m._get_fsdp_state()._fsdp_param_group is not None])
+        # the reduce-scatter wrapper patches FSDP2 class-wide: every FSDP2 unit of the model is checked before it is installed
+        layer_comm.configure(all_groups=[m._get_fsdp_state()._fsdp_param_group for m in model.modules()
+                                         if isinstance(m, FSDPModule) and m._get_fsdp_state()._fsdp_param_group is not None])
         logger.info_rank0(f"LayerCommScheduler: depth={layer_comm.depth}, no_reshard_after_backward={layer_comm.no_reshard}, "
                           f"{layer_comm.n} layers, prologue under {args.train.fsdp_prologue_under}"
                           f"{f' after {len(layer_comm.prefix)} prefix units' if layer_comm.prefix else ''}, "
                           f"reduce-scatters in flight {layer_comm.rs_inflight_depth}"
-                          f"{f' (wrapper installed, RS stress {layer_comm.rs_inflight.stress_ticks} ticks)' if layer_comm.rs_inflight is not None else ''}")
+                          f"{' (post_backward wrapper installed)' if layer_comm.rs_inflight is not None else ''}")
     logger.info_rank0(model)
     if args.train.use_compile:
         model = torch.compile(model)
@@ -951,7 +964,7 @@ def main():
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
                 future_video_effective_fps = micro_batch.pop('future_video_effective_fps', None)
-                if layer_comm is not None and global_step > 1 and not layer_comm.prefix:
+                if layer_comm is not None and global_step > 1 and args.train.fsdp_prologue_under == "teacher":
                     layer_comm.prologue()
                 depth_forward_time = 0
                 if use_depth_align and teacher_cache_mode == "read":
@@ -1006,8 +1019,8 @@ def main():
                         future_video_targets = cached["teacher_video_future"]
                         future_video_current_dino = cached["teacher_video_current"]
 
-                if layer_comm is not None and global_step > 1 and layer_comm.prefix:
-                    layer_comm.prologue()  # fsdp_prologue_under=vit: its all-gathers run under the ViT / prefix compute
+                if layer_comm is not None and global_step > 1 and args.train.fsdp_prologue_under == "vit":
+                    layer_comm.prologue()  # its all-gathers run under the ViT / prefix compute
                 with model_fwd_context:
                     model_outputs = model(
                         **micro_batch,
@@ -1058,7 +1071,7 @@ def main():
                     layer_comm.after_backward()
                     if layer_comm.no_reshard and global_step <= 3 and args.train.global_rank == 0:
                         _alloc_after = torch.cuda.memory_allocated()
-                        logger.info(f"layer_comm reshard after backward, step {global_step}: memory_allocated "
+                        logger.info(f"layer_comm after_backward, step {global_step}: memory_allocated "
                                     f"{_alloc_before / 2**30:.3f} -> {_alloc_after / 2**30:.3f} GiB "
                                     f"(-{(_alloc_before - _alloc_after) / 2**30:.3f} GiB)")
 
