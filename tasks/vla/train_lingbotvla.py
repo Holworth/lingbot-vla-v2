@@ -385,6 +385,10 @@ def main():
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
+    if args.train.fsdp_align_root and args.train.action_fp32:
+        # _fp32_linear reads action_out_proj's weight directly, and in its own FSDP2 unit that weight is sharded outside
+        # the unit's forward
+        raise ValueError("fsdp_align_root requires action_fp32=false")
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
     dist.init_process_group(backend="nccl")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)

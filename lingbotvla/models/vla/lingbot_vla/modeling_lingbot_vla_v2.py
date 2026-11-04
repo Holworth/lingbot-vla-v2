@@ -2,6 +2,7 @@ import einops
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule
 from typing import List, Optional, Tuple, Union
 
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedModel
@@ -889,7 +890,11 @@ class FlowMatchingV2(FlowMatchingV1):
         if getattr(self.config, "action_fp32", False):
             v_t = self._fp32_linear(self.action_out_proj, suffix_out)
         else:
-            if suffix_out.dtype != self.action_out_proj.weight.dtype:
+            # With --train.fsdp_align_root, action_out_proj is its own FSDP2 unit: its weight is sharded outside its
+            # forward, and torch 2.8's dynamo crashes reading it there once it has a gradient (GA > 1). FSDP's
+            # pre-forward hook casts suffix_out to the unit's parameter dtype (mixed-precision policy) instead.
+            fsdp_unit = isinstance(self.action_out_proj, FSDPModule)
+            if not fsdp_unit and suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
 
@@ -1053,7 +1058,11 @@ class FlowMatchingV2(FlowMatchingV1):
         if getattr(self.config, "action_fp32", False):
             v_t = self._fp32_linear(self.action_out_proj, suffix_out)
         else:
-            if suffix_out.dtype != self.action_out_proj.weight.dtype:
+            # With --train.fsdp_align_root, action_out_proj is its own FSDP2 unit: its weight is sharded outside its
+            # forward, and torch 2.8's dynamo crashes reading it there once it has a gradient (GA > 1). FSDP's
+            # pre-forward hook casts suffix_out to the unit's parameter dtype (mixed-precision policy) instead.
+            fsdp_unit = isinstance(self.action_out_proj, FSDPModule)
+            if not fsdp_unit and suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
         return v_t
